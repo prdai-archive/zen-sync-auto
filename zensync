@@ -1,0 +1,383 @@
+#!/bin/bash
+set -euo pipefail
+
+# zensync — one-command Zen Browser sync (bookmarks, history, cookies, logins,
+# workspaces, tabs, prefs) between two machines via a plaintext Cloudflare R2
+# bucket. Fork of zen-sync with encryption removed and everything collapsed
+# into a single `zensync` command: close Zen, pull + merge remote, push the
+# merged result back, reopen Zen.
+
+# ─── Config ───────────────────────────────────────────────────────────
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/zensync"
+CONFIG_FILE="$CONFIG_DIR/config"
+OS_NAME="$(uname -s)"
+
+# ─── Colors & UI ─────────────────────────────────────────────────────
+R="\033[0m"
+B="\033[1m"
+D="\033[2m"
+PURPLE="\033[38;2;147;130;220m"
+GREEN="\033[38;2;130;200;160m"
+RED="\033[38;2;210;100;120m"
+YELLOW="\033[38;2;220;180;100m"
+WHITE="\033[38;2;200;200;210m"
+
+die()  { printf "${RED}${B} error${R} ${WHITE}%s${R}\n" "$*" >&2; exit 1; }
+ok()   { printf "${GREEN}  ✓${R} ${WHITE}%s${R}\n" "$*"; }
+fail() { printf "${RED}  ✗${R} ${WHITE}%s${R}\n" "$*" >&2; }
+step() { printf "${PURPLE}%s${R} ${D}%s${R}\n" "$1" "$2"; }
+dim()  { printf "${D}%s${R}\n" "$*"; }
+
+header() {
+    local label="zensync $1"
+    local inner=33
+    local pad=$(( (inner - ${#label}) / 2 ))
+    local rpad=$(( inner - ${#label} - pad ))
+    printf "\n"
+    printf "${PURPLE}${B}  ╭─────────────────────────────────╮${R}\n"
+    printf "${PURPLE}${B}  │${R}${B}%*s%s%*s${PURPLE}${B}│${R}\n" "$((pad))" "" "$label" "$((rpad))" ""
+    printf "${PURPLE}${B}  ╰─────────────────────────────────╯${R}\n"
+    printf "\n"
+}
+
+usage() {
+    header "help"
+    printf "${B}  Usage:${R}\n"
+    printf "    ${WHITE}zensync${R}              ${D}Close Zen, pull+merge remote, push, reopen Zen${R}\n"
+    printf "    ${WHITE}zensync${R} ${YELLOW}status${R}       ${D}Compare local vs remote${R}\n"
+    printf "    ${WHITE}zensync${R} ${YELLOW}init${R}         ${D}Setup wizard (Cloudflare R2, plaintext)${R}\n"
+    printf "\n"
+    printf "  ${D}One bucket, one command, no encryption. Config: %s${R}\n" "$CONFIG_DIR/config"
+    printf "\n"
+    exit 0
+}
+
+# ─── Zen process management (macOS + Linux) ───────────────────────────
+# Process name: zen-bin on Linux, zen on macOS. Launch: zen-browser / open -a Zen.
+zen_proc_name() {
+    if [[ "$OS_NAME" == "Darwin" ]]; then echo "zen"; else echo "zen-bin"; fi
+}
+
+zen_close_local() {
+    local pids
+    pids=$(pgrep -x "$(zen_proc_name)" 2>/dev/null || true)
+    if [[ -n "$pids" ]]; then
+        step "  ◼" "Closing Zen..."
+        kill -SIGTERM $(echo "$pids" | head -1) 2>/dev/null || true
+        for _ in $(seq 1 10); do
+            pgrep -x "$(zen_proc_name)" >/dev/null 2>&1 || break
+            sleep 0.5
+        done
+    fi
+}
+
+zen_open_local() {
+    step "  ▶" "Reopening Zen..."
+    if [[ "$OS_NAME" == "Darwin" ]]; then
+        open -a Zen
+    else
+        nohup zen-browser >/dev/null 2>&1 &
+    fi
+}
+
+# ─── Resolve script + helper locations ────────────────────────────────
+resolve_script_dir() {
+    local dir
+    dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    if [[ -L "${BASH_SOURCE[0]}" ]]; then
+        dir="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+    fi
+    echo "$dir"
+}
+
+SCRIPT_DIR="$(resolve_script_dir)"
+
+find_py() {
+    local name="$1"
+    local path="$SCRIPT_DIR/$name"
+    [[ -f "$path" ]] && { echo "$path"; return; }
+    path="$HOME/.local/lib/zensync/$name"
+    [[ -f "$path" ]] && { echo "$path"; return; }
+    die "$name not found. Re-run install."
+}
+
+# ─── Profile discovery (macOS + Linux, incl. flatpak) ─────────────────
+find_zen_dir() {
+    local candidates=(
+        "$HOME/Library/Application Support/zen/Profiles"
+        "$HOME/.config/zen"
+        "$HOME/.zen"
+        "$HOME/.var/app/app.zen_browser.zen/.zen"
+    )
+    for d in "${candidates[@]}"; do
+        [[ -d "$d" ]] && { echo "$d"; return; }
+    done
+    die "Zen Browser not found (tried ~/Library/Application Support/zen/Profiles, ~/.config/zen, ~/.zen and the flatpak path)"
+}
+
+find_local_profile() {
+    local zen_dir
+    zen_dir=$(find_zen_dir)
+
+    local profiles=()
+    while IFS= read -r d; do
+        [[ -f "$d/zen-sessions.jsonlz4" ]] && profiles+=("$d")
+    done < <(find "$zen_dir" -maxdepth 1 -type d -name "*.Default (release)" 2>/dev/null)
+
+    if [[ ${#profiles[@]} -eq 0 ]]; then
+        while IFS= read -r d; do
+            [[ -f "$d/zen-sessions.jsonlz4" ]] && profiles+=("$d")
+        done < <(find "$zen_dir" -maxdepth 1 -type d 2>/dev/null)
+    fi
+
+    [[ ${#profiles[@]} -gt 0 ]] || die "no Zen profile found with zen-sessions.jsonlz4"
+
+    if [[ ${#profiles[@]} -eq 1 ]]; then
+        echo "${profiles[0]}"
+    else
+        echo "Multiple profiles found:" >&2
+        for i in "${!profiles[@]}"; do
+            echo "  [$i] ${profiles[$i]}" >&2
+        done
+        read -rp "Select profile [0]: " choice
+        echo "${profiles[${choice:-0}]}"
+    fi
+}
+
+# ─── Config management ─────────────────────────────────────────────────
+load_config() {
+    [[ -f "$CONFIG_FILE" ]] || die "not configured. Run 'zensync init' first."
+    source "$CONFIG_FILE"
+    : "${R2_ACCOUNT_ID:?}" "${R2_ACCESS_KEY:?}" "${R2_SECRET_KEY:?}" "${R2_BUCKET:?}" "${LOCAL_PROFILE:?}"
+}
+
+human_size() {
+    if command -v numfmt >/dev/null 2>&1; then
+        numfmt --to=iec "$1"
+    else
+        python3 -c "
+n = float($1)
+for u in ('', 'K', 'M', 'G', 'T'):
+    if n < 1024: print(f'{n:.0f}{u}' if u == '' else f'{n:.1f}{u}'); break
+    n /= 1024
+"
+    fi
+}
+
+# ─── Files that are synced ─────────────────────────────────────────────
+# Everything: workspaces/tabs/spaces, bookmarks+history, favicons, site
+# permissions, UI layout (sidebar placement etc via prefs.js/xulstore.json),
+# containers, cookies, and saved logins. Session/tab files get merged
+# (merge.py); everything else is copied whichever side is newer.
+SYNC_FILES=(
+    "zen-sessions.jsonlz4"
+    "zen-sessions-backup/clean.jsonlz4"
+    "sessionstore-backups/recovery.jsonlz4"
+    "sessionstore-backups/recovery.baklz4"
+    "sessionstore-backups/previous.jsonlz4"
+    "prefs.js"
+    "xulstore.json"
+    "containers.json"
+    "places.sqlite"
+    "favicons.sqlite"
+    "permissions.sqlite"
+    "cookies.sqlite"
+    "logins.json"
+    "key4.db"
+)
+
+MERGE_FILES=(
+    "zen-sessions.jsonlz4"
+    "zen-sessions-backup/clean.jsonlz4"
+    "sessionstore-backups/recovery.jsonlz4"
+    "sessionstore-backups/recovery.baklz4"
+    "sessionstore-backups/previous.jsonlz4"
+)
+
+mtime_of() {
+    [[ -f "$1" ]] || { echo 0; return; }
+    if [[ "$OS_NAME" == "Darwin" ]]; then
+        stat -f %m "$1"
+    else
+        stat -c %Y "$1"
+    fi
+}
+
+# ─── Init ─────────────────────────────────────────────────────────────
+prompt() {
+    local label="$1" default="${2:-}"
+    if [[ -n "$default" ]]; then
+        printf "  ${PURPLE}›${R} ${WHITE}%s${R} ${D}[%s]${R} " "$label" "$default"
+    else
+        printf "  ${PURPLE}›${R} ${WHITE}%s${R} " "$label"
+    fi
+}
+
+cmd_init() {
+    mkdir -p "$CONFIG_DIR"
+    header "init"
+
+    printf "  ${D}Cloudflare R2, plaintext (no age/pgp layer). Make sure the bucket${R}\n"
+    printf "  ${D}is private and the API token is scoped to this bucket only.${R}\n\n"
+
+    step "  ⟳" "Finding local Zen profile..."
+    local local_profile
+    local_profile=$(find_local_profile)
+    ok "Local: $(basename "$local_profile")"
+    printf "\n"
+
+    prompt "Cloudflare Account ID"; read -r account_id
+    prompt "R2 Access Key ID"; read -r access_key
+    prompt "R2 Secret Access Key"; read -r secret_key
+    prompt "R2 Bucket name"; read -r bucket
+
+    printf "\n"
+    step "  ⟳" "Testing R2 connection..."
+    local cloud_py
+    cloud_py=$(find_py "cloud.py")
+    local test_config
+    test_config=$(printf '{"account_id":"%s","access_key":"%s","secret_key":"%s","bucket":"%s"}' \
+        "$account_id" "$access_key" "$secret_key" "$bucket")
+    if python3 "$cloud_py" test "$test_config" >/dev/null 2>&1; then
+        ok "R2 connected"
+    else
+        die "could not connect to R2. Check your credentials and bucket name."
+    fi
+
+    cat > "$CONFIG_FILE" <<CONF
+R2_ACCOUNT_ID="$account_id"
+R2_ACCESS_KEY="$access_key"
+R2_SECRET_KEY="$secret_key"
+R2_BUCKET="$bucket"
+LOCAL_PROFILE="$local_profile"
+CONF
+    chmod 600 "$CONFIG_FILE"
+
+    printf "\n"
+    printf "  ${GREEN}${B}✓ Config saved${R}\n"
+    dim "  Run 'zensync init' on your other machine with the same bucket."
+    dim "  Then just run 'zensync' on either machine whenever you switch."
+    printf "\n"
+}
+
+# ─── Sync (the one command) ────────────────────────────────────────────
+cmd_sync() {
+    load_config
+    header "sync"
+
+    zen_close_local
+
+    local cloud_py merge_py
+    cloud_py=$(find_py "cloud.py")
+    merge_py=$(find_py "merge.py")
+
+    local tmp_dir
+    tmp_dir=$(mktemp -d)
+
+    step "  ↓" "Pulling remote snapshot..."
+    local pull_config
+    pull_config=$(printf '{"account_id":"%s","access_key":"%s","secret_key":"%s","bucket":"%s","profile":"%s"}' \
+        "$R2_ACCOUNT_ID" "$R2_ACCESS_KEY" "$R2_SECRET_KEY" "$R2_BUCKET" "$tmp_dir")
+    local pull_result
+    pull_result=$(python3 "$cloud_py" pull "$pull_config" 2>/dev/null || echo '{"error":"pull failed"}')
+    local pull_error
+    pull_error=$(echo "$pull_result" | python3 -c "import sys,json; print(json.load(sys.stdin).get('error',''))" 2>/dev/null || echo "")
+
+    if [[ -n "$pull_error" ]]; then
+        dim "  No remote snapshot yet (first run) — will push local as-is."
+    else
+        ok "Remote snapshot downloaded"
+
+        if [[ -f "$tmp_dir/zen-sessions.jsonlz4" ]]; then
+            step "  ⇄" "Merging tabs & workspaces..."
+            [[ -f "$tmp_dir/sessionstore-backups/recovery.jsonlz4" ]] && \
+                cp "$tmp_dir/sessionstore-backups/recovery.jsonlz4" "$tmp_dir/recovery.jsonlz4"
+            local merge_result
+            merge_result=$(python3 "$merge_py" "$LOCAL_PROFILE" "$tmp_dir" 2>/dev/null || echo '{}')
+            local new_tabs new_spaces
+            new_tabs=$(echo "$merge_result" | python3 -c "import sys,json; print(json.load(sys.stdin).get('new_tabs',0))" 2>/dev/null || echo 0)
+            new_spaces=$(echo "$merge_result" | python3 -c "import sys,json; print(json.load(sys.stdin).get('new_spaces',0))" 2>/dev/null || echo 0)
+            [[ "$new_tabs" -gt 0 || "$new_spaces" -gt 0 ]] && ok "Merged $new_tabs new tabs, $new_spaces new spaces" || dim "  Nothing new to merge"
+        fi
+
+        step "  ⇄" "Syncing everything else (cookies, logins, bookmarks, prefs)..."
+        for f in "${SYNC_FILES[@]}"; do
+            local is_merge_file=false
+            for mf in "${MERGE_FILES[@]}"; do
+                [[ "$f" == "$mf" ]] && is_merge_file=true && break
+            done
+            [[ "$is_merge_file" == "true" ]] && continue
+
+            local remote_f="$tmp_dir/$f"
+            local local_f="$LOCAL_PROFILE/$f"
+            [[ -f "$remote_f" ]] || continue
+
+            local remote_mtime local_mtime
+            remote_mtime=$(mtime_of "$remote_f")
+            local_mtime=$(mtime_of "$local_f")
+
+            if [[ "$remote_mtime" -gt "$local_mtime" ]]; then
+                mkdir -p "$(dirname "$local_f")"
+                cp -p "$remote_f" "$local_f"
+                ok "$f (took remote, newer)"
+            fi
+        done
+    fi
+
+    rm -rf "$tmp_dir"
+
+    printf "\n"
+    step "  ↑" "Pushing merged snapshot to R2..."
+    local push_config
+    push_config=$(printf '{"account_id":"%s","access_key":"%s","secret_key":"%s","bucket":"%s","profile":"%s"}' \
+        "$R2_ACCOUNT_ID" "$R2_ACCESS_KEY" "$R2_SECRET_KEY" "$R2_BUCKET" "$LOCAL_PROFILE")
+    local push_result
+    push_result=$(python3 "$cloud_py" push "$push_config") || die "push failed"
+    local raw_size
+    raw_size=$(echo "$push_result" | python3 -c "import sys,json; print(json.load(sys.stdin)['raw_size'])")
+    ok "Uploaded $(human_size "$raw_size")"
+
+    printf "\n"
+    zen_open_local
+
+    printf "\n  ${GREEN}${B}✓ Sync complete${R}\n\n"
+}
+
+# ─── Status ───────────────────────────────────────────────────────────
+cmd_status() {
+    load_config
+    header "status"
+
+    printf "  ${PURPLE}${B}LOCAL${R} ${D}(%s)${R}\n" "$(hostname)"
+    printf "  ${D}%s${R}\n" "$LOCAL_PROFILE"
+
+    local cloud_py
+    cloud_py=$(find_py "cloud.py")
+    local status_config
+    status_config=$(printf '{"account_id":"%s","access_key":"%s","secret_key":"%s","bucket":"%s"}' \
+        "$R2_ACCOUNT_ID" "$R2_ACCESS_KEY" "$R2_SECRET_KEY" "$R2_BUCKET")
+
+    printf "\n  ${PURPLE}${B}REMOTE${R} ${D}(R2 bucket: %s)${R}\n" "$R2_BUCKET"
+    local result
+    result=$(python3 "$cloud_py" status "$status_config" 2>/dev/null || echo '{"error":"could not reach R2"}')
+    local error
+    error=$(echo "$result" | python3 -c "import sys,json; print(json.load(sys.stdin).get('error',''))" 2>/dev/null)
+    if [[ -n "$error" ]]; then
+        fail "$error"
+    else
+        local ts hostname_r
+        ts=$(echo "$result" | python3 -c "import sys,json; print(json.load(sys.stdin)['timestamp'])")
+        hostname_r=$(echo "$result" | python3 -c "import sys,json; print(json.load(sys.stdin)['hostname'])")
+        dim "  Last push: $ts from $hostname_r"
+    fi
+    printf "\n"
+}
+
+# ─── Main ─────────────────────────────────────────────────────────────
+case "${1:-sync}" in
+    sync)   cmd_sync ;;
+    status) cmd_status ;;
+    init)   cmd_init ;;
+    help|--help|-h) usage ;;
+    *)      die "unknown command: $1. Run 'zensync help'" ;;
+esac
