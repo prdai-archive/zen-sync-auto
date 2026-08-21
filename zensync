@@ -48,6 +48,7 @@ usage() {
     header "help"
     printf "${B}  Usage:${R}\n"
     printf "    ${WHITE}zensync${R}              ${D}Close Zen, pull+merge remote, push, reopen Zen${R}\n"
+    printf "    ${WHITE}zensync${R} ${YELLOW}pull${R}         ${D}Pull remote onto this machine only, never pushes${R}\n"
     printf "    ${WHITE}zensync${R} ${YELLOW}status${R}       ${D}Show last sync info${R}\n"
     printf "    ${WHITE}zensync${R} ${YELLOW}init${R}         ${D}Setup wizard (uses your gh auth session)${R}\n"
     printf "\n"
@@ -168,7 +169,13 @@ gh_token() {
 # extra header instead of embedding it in the remote URL or repo config, so
 # it never gets persisted to disk.
 git_data() {
-    git -C "$DATA_DIR" -c "http.https://github.com/.extraheader=AUTHORIZATION: bearer $(gh_token)" "$@"
+    # GitHub's git-over-HTTPS rejects "AUTHORIZATION: bearer <token>" for the
+    # OAuth tokens gh issues -- it answers "remote: invalid credentials" -- so
+    # use Basic auth, which is what GitHub documents for PAT/OAuth tokens.
+    # Bearer only works for GitHub App installation tokens.
+    local auth
+    auth=$(printf 'x-access-token:%s' "$(gh_token)" | base64 | tr -d '\n')
+    git -C "$DATA_DIR" -c "http.https://github.com/.extraheader=Authorization: Basic $auth" "$@"
 }
 
 # ─── Files that are synced ─────────────────────────────────────────────
@@ -348,6 +355,71 @@ CONF
     printf "\n"
 }
 
+# ─── Pull only (remote -> local, never pushes) ─────────────────────────
+# Same first half as cmd_sync, minus the commit/push. Used when you only want
+# to bring this machine up to date -- e.g. a freshly installed Zen -- without
+# publishing local state back to the data repo.
+#
+# Unlike sync, non-session files are taken from the remote unconditionally
+# rather than by mtime comparison. A fresh profile's files are newer than the
+# repo's by definition, so an mtime check would make "pull" a no-op exactly
+# when you need it most.
+cmd_pull() {
+    load_config
+    require_gh
+    header "pull"
+
+    zen_close_local
+
+    [[ -d "$DATA_DIR/.git" ]] || die "data repo missing at $DATA_DIR. Run 'zensync init'."
+
+    step "  ↓" "Pulling latest from $GH_OWNER/$GH_REPO..."
+    git_data fetch --quiet origin main 2>/dev/null || die "fetch failed — check network/gh auth"
+    local remote_exists
+    remote_exists=$(git_data rev-parse --verify origin/main 2>/dev/null || echo "")
+    [[ -n "$remote_exists" ]] || die "no remote data yet — run 'zensync' on the other machine first"
+    git_data checkout --quiet -B main origin/main 2>/dev/null || \
+        git_data reset --quiet --hard origin/main
+    ok "Data repo up to date"
+
+    if [[ -f "$DATA_DIR/zen-sessions.jsonlz4" ]]; then
+        step "  ⇄" "Merging tabs & workspaces..."
+        local merge_py
+        merge_py=$(find_py "merge.py")
+        [[ -f "$DATA_DIR/sessionstore-backups/recovery.jsonlz4" ]] && \
+            cp "$DATA_DIR/sessionstore-backups/recovery.jsonlz4" "$DATA_DIR/recovery.jsonlz4"
+        local merge_result
+        merge_result=$(python3 "$merge_py" "$LOCAL_PROFILE" "$DATA_DIR" 2>/dev/null || echo '{}')
+        local new_tabs new_spaces
+        new_tabs=$(echo "$merge_result" | python3 -c "import sys,json; print(json.load(sys.stdin).get('new_tabs',0))" 2>/dev/null || echo 0)
+        new_spaces=$(echo "$merge_result" | python3 -c "import sys,json; print(json.load(sys.stdin).get('new_spaces',0))" 2>/dev/null || echo 0)
+        [[ "$new_tabs" -gt 0 || "$new_spaces" -gt 0 ]] && ok "Merged $new_tabs new tabs, $new_spaces new spaces" || dim "  Nothing new to merge"
+        rm -f "$DATA_DIR/recovery.jsonlz4"
+    fi
+
+    step "  ⇄" "Taking remote cookies, logins, bookmarks, prefs..."
+    local taken=0
+    for f in "${SYNC_FILES[@]}"; do
+        is_merge_file "$f" && continue
+        local repo_f="$DATA_DIR/$f"
+        local local_f="$LOCAL_PROFILE/$f"
+        [[ -f "$repo_f" ]] || continue
+        mkdir -p "$(dirname "$local_f")"
+        cp -p "$repo_f" "$local_f"
+        taken=$((taken + 1))
+    done
+    ok "Took $taken files from remote"
+
+    step "  ⇄" "Syncing extensions, extension settings & theme CSS..."
+    merge_dirs_from_repo
+    ok "Directories merged"
+
+    printf "\n"
+    zen_open_local
+
+    printf "\n  ${GREEN}${B}✓ Pull complete${R} ${D}(nothing was pushed)${R}\n\n"
+}
+
 # ─── Sync (the one command) ────────────────────────────────────────────
 cmd_sync() {
     load_config
@@ -470,6 +542,7 @@ cmd_status() {
 # ─── Main ─────────────────────────────────────────────────────────────
 case "${1:-sync}" in
     sync)   cmd_sync ;;
+    pull)   cmd_pull ;;
     status) cmd_status ;;
     init)   cmd_init ;;
     help|--help|-h) usage ;;

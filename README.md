@@ -90,8 +90,19 @@ zensync init             # on machine B — same owner/repo name, own gh auth
 
 ```bash
 zensync           # close Zen, merge with remote, push, reopen Zen
+zensync pull       # bring this machine up to date only -- never pushes
 zensync status     # see when the data repo was last synced and from where
 ```
+
+`pull` is the one-way half of `sync`: it fetches, merges tabs and workspaces,
+copies everything else in, and reopens Zen, but never commits or pushes. Use
+it when a machine should receive state without publishing its own -- a fresh
+Zen install being the obvious case.
+
+Where `sync` decides each non-session file by comparing mtimes, `pull` always
+takes the remote copy. A newly created profile's files are newer than the
+repo's by definition, so an mtime check would make `pull` do nothing exactly
+when you need it.
 
 No scheduler is set up — run it manually when you switch machines.
 
