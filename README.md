@@ -1,18 +1,19 @@
 # zen-sync-auto
 
 One-command Zen Browser sync between machines. Fork of
-[zen-sync](https://github.com/prdai-archive/zen-sync) with the SSH mode and
-age encryption stripped out, and everything collapsed into a single command.
+[zen-sync](https://github.com/prdai-archive/zen-sync), backed by a private
+GitHub repo instead of a cloud bucket, using your existing `gh auth login`
+session — no separate credentials, no encryption layer to manage.
 
 ```
 zensync
 ```
 
-That's it. It closes Zen, pulls whatever is in your R2 bucket, merges tabs
-and workspaces, takes the newer copy of everything else, pushes the merged
-result back up, and reopens Zen. Run it before you close your laptop and
-again when you open the other machine, and logins/cookies/bookmarks/tabs
-just show up.
+That's it. It closes Zen, pulls whatever is in the private data repo,
+merges tabs and workspaces, takes the newer copy of everything else, pushes
+the merged result back, and reopens Zen. Run it before you close your
+laptop and again when you open the other machine, and logins, cookies,
+bookmarks, and tabs just show up.
 
 ## What gets synced
 
@@ -25,51 +26,60 @@ just show up.
   placement, toolbar customizations, etc.
 
 Anything that isn't a session/tab file (i.e. can't be meaningfully merged)
-is copied whichever side has the newer mtime — last-write-wins per file, not
-per bucket.
+is copied from whichever side has the newer content, decided by comparing
+the local file's mtime against the data repo's last commit touching that
+path — not just "whoever pushed last wins."
+
+## How storage works
+
+`zensync init` creates (or reuses) a **private** GitHub repo — default
+`prdai-archive/zensync-data` — and clones it to
+`~/.local/share/zensync/repo`. Every sync commits the current profile state
+there and pushes. Auth is entirely `gh`'s: the script pulls a token via
+`gh auth token` and passes it as a transient header on each git operation —
+it's never written into `.git/config` or any file on disk.
+
+Commits are made under a fixed bot identity (`zensync-bot`, not your real
+git name/email), so the repo's commit log doesn't leak personal info even
+though it's already private.
 
 ## ⚠️ No encryption, by design
 
-This fork uploads a **plaintext** tar to your R2 bucket over HTTPS (TLS
-in transit only, nothing at rest). That tar contains your cookies and saved
-logins — i.e. active session tokens and passwords for every site you're
-logged into. Anyone with read access to that bucket can take over those
-sessions without a password.
+The data repo holds **plaintext** cookies and saved logins — i.e. active
+session tokens and passwords for every site you're logged into. This is
+safe only as long as:
 
-This tradeoff only makes sense if:
-- The R2 bucket is **private** (default — just don't make it public)
-- The API token you generate is **scoped to this one bucket only**
-- You're not sharing the bucket or credentials with anyone else
+- The repo stays **private** (never flip it public)
+- You don't add outside collaborators to it
+- Your `gh` session / GitHub account itself is secured (2FA, etc.) — anyone
+  with access to your GitHub account or a clone of that repo has your
+  sessions
 
-If you want encryption at rest, use upstream
-[zen-sync](https://github.com/prdai-archive/zen-sync) instead (age + R2, or
-SSH direct device-to-device).
+If you want an encrypted-at-rest option instead, use upstream
+[zen-sync](https://github.com/prdai-archive/zen-sync) (age + R2, or SSH
+direct device-to-device).
 
 ## Setup
 
 ```bash
+gh auth login          # if you haven't already
 ./install.sh
-zensync init   # on machine A — pick/create the R2 bucket, get credentials
-zensync init   # on machine B — same account ID / bucket / keys
+zensync init             # on machine A — creates the private data repo
+zensync init             # on machine B — same owner/repo name, own gh auth
 ```
-
-`init` needs a Cloudflare account ID, an R2 API token (access key + secret),
-and a bucket name. Create the token in the Cloudflare dashboard scoped to
-R2 → your bucket → Object Read & Write.
 
 ## Usage
 
 ```bash
 zensync           # close Zen, merge with remote, push, reopen Zen
-zensync status     # see when the bucket was last updated and by which host
+zensync status     # see when the data repo was last synced and from where
 ```
 
-No scheduler is set up — run it manually when you switch machines. (If you
-want it automatic on login/logout later, that's a small addition on top —
-not built in here on purpose, to keep this to one predictable command.)
+No scheduler is set up — run it manually when you switch machines.
 
 ## Requirements
 
+- `gh` (GitHub CLI), logged in via `gh auth login`
 - `python3`
 - `liblz4` (for reading/writing Zen's `.jsonlz4` session files) —
   `brew install lz4` / `sudo pacman -S lz4` / `apt install liblz4-1`

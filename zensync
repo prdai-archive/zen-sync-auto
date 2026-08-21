@@ -2,15 +2,19 @@
 set -euo pipefail
 
 # zensync — one-command Zen Browser sync (bookmarks, history, cookies, logins,
-# workspaces, tabs, prefs) between two machines via a plaintext Cloudflare R2
-# bucket. Fork of zen-sync with encryption removed and everything collapsed
-# into a single `zensync` command: close Zen, pull + merge remote, push the
-# merged result back, reopen Zen.
+# workspaces, tabs, prefs) between machines, backed by a private GitHub repo
+# instead of a cloud bucket. Uses your existing `gh auth login` session — no
+# separate credentials, no encryption layer. Commits are made under a fixed
+# bot identity, not your real git identity.
 
 # ─── Config ───────────────────────────────────────────────────────────
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/zensync"
 CONFIG_FILE="$CONFIG_DIR/config"
+DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/zensync/repo"
 OS_NAME="$(uname -s)"
+
+GIT_COMMIT_NAME="zensync-bot"
+GIT_COMMIT_EMAIL="zensync-bot@users.noreply.github.com"
 
 # ─── Colors & UI ─────────────────────────────────────────────────────
 R="\033[0m"
@@ -44,16 +48,15 @@ usage() {
     header "help"
     printf "${B}  Usage:${R}\n"
     printf "    ${WHITE}zensync${R}              ${D}Close Zen, pull+merge remote, push, reopen Zen${R}\n"
-    printf "    ${WHITE}zensync${R} ${YELLOW}status${R}       ${D}Compare local vs remote${R}\n"
-    printf "    ${WHITE}zensync${R} ${YELLOW}init${R}         ${D}Setup wizard (Cloudflare R2, plaintext)${R}\n"
+    printf "    ${WHITE}zensync${R} ${YELLOW}status${R}       ${D}Show last sync info${R}\n"
+    printf "    ${WHITE}zensync${R} ${YELLOW}init${R}         ${D}Setup wizard (uses your gh auth session)${R}\n"
     printf "\n"
-    printf "  ${D}One bucket, one command, no encryption. Config: %s${R}\n" "$CONFIG_DIR/config"
+    printf "  ${D}Backed by a private GitHub repo, not a cloud bucket. Config: %s${R}\n" "$CONFIG_DIR/config"
     printf "\n"
     exit 0
 }
 
 # ─── Zen process management (macOS + Linux) ───────────────────────────
-# Process name: zen-bin on Linux, zen on macOS. Launch: zen-browser / open -a Zen.
 zen_proc_name() {
     if [[ "$OS_NAME" == "Darwin" ]]; then echo "zen"; else echo "zen-bin"; fi
 }
@@ -148,27 +151,30 @@ find_local_profile() {
 load_config() {
     [[ -f "$CONFIG_FILE" ]] || die "not configured. Run 'zensync init' first."
     source "$CONFIG_FILE"
-    : "${R2_ACCOUNT_ID:?}" "${R2_ACCESS_KEY:?}" "${R2_SECRET_KEY:?}" "${R2_BUCKET:?}" "${LOCAL_PROFILE:?}"
+    : "${GH_OWNER:?}" "${GH_REPO:?}" "${LOCAL_PROFILE:?}"
 }
 
-human_size() {
-    if command -v numfmt >/dev/null 2>&1; then
-        numfmt --to=iec "$1"
-    else
-        python3 -c "
-n = float($1)
-for u in ('', 'K', 'M', 'G', 'T'):
-    if n < 1024: print(f'{n:.0f}{u}' if u == '' else f'{n:.1f}{u}'); break
-    n /= 1024
-"
-    fi
+require_gh() {
+    command -v gh >/dev/null 2>&1 || die "gh (GitHub CLI) not found. Install it: brew install gh"
+    gh auth status >/dev/null 2>&1 || die "not logged in to gh. Run 'gh auth login' first."
+}
+
+gh_token() {
+    gh auth token
+}
+
+# All git operations against the data repo pass the token as a transient
+# extra header instead of embedding it in the remote URL or repo config, so
+# it never gets persisted to disk.
+git_data() {
+    git -C "$DATA_DIR" -c "http.https://github.com/.extraheader=AUTHORIZATION: bearer $(gh_token)" "$@"
 }
 
 # ─── Files that are synced ─────────────────────────────────────────────
 # Everything: workspaces/tabs/spaces, bookmarks+history, favicons, site
 # permissions, UI layout (sidebar placement etc via prefs.js/xulstore.json),
 # containers, cookies, and saved logins. Session/tab files get merged
-# (merge.py); everything else is copied whichever side is newer.
+# (merge.py); everything else is copied whichever side has newer content.
 SYNC_FILES=(
     "zen-sessions.jsonlz4"
     "zen-sessions-backup/clean.jsonlz4"
@@ -194,6 +200,14 @@ MERGE_FILES=(
     "sessionstore-backups/previous.jsonlz4"
 )
 
+is_merge_file() {
+    local f="$1"
+    for mf in "${MERGE_FILES[@]}"; do
+        [[ "$f" == "$mf" ]] && return 0
+    done
+    return 1
+}
+
 mtime_of() {
     [[ -f "$1" ]] || { echo 0; return; }
     if [[ "$OS_NAME" == "Darwin" ]]; then
@@ -201,6 +215,21 @@ mtime_of() {
     else
         stat -c %Y "$1"
     fi
+}
+
+# Timestamp of the last commit that touched this path in the data repo.
+repo_commit_time_of() {
+    git_data log -1 --format=%ct -- "$1" 2>/dev/null || echo 0
+}
+
+copy_profile_into_repo() {
+    for f in "${SYNC_FILES[@]}"; do
+        local src="$LOCAL_PROFILE/$f"
+        [[ -f "$src" ]] || continue
+        local dst="$DATA_DIR/$f"
+        mkdir -p "$(dirname "$dst")"
+        cp -p "$src" "$dst"
+    done
 }
 
 # ─── Init ─────────────────────────────────────────────────────────────
@@ -214,48 +243,61 @@ prompt() {
 }
 
 cmd_init() {
-    mkdir -p "$CONFIG_DIR"
+    mkdir -p "$CONFIG_DIR" "$(dirname "$DATA_DIR")"
     header "init"
 
-    printf "  ${D}Cloudflare R2, plaintext (no age/pgp layer). Make sure the bucket${R}\n"
-    printf "  ${D}is private and the API token is scoped to this bucket only.${R}\n\n"
+    step "  ⟳" "Checking gh auth..."
+    require_gh
+    local gh_user
+    gh_user=$(gh api user --jq .login)
+    ok "Logged in as $gh_user"
 
+    printf "\n"
     step "  ⟳" "Finding local Zen profile..."
     local local_profile
     local_profile=$(find_local_profile)
     ok "Local: $(basename "$local_profile")"
-    printf "\n"
-
-    prompt "Cloudflare Account ID"; read -r account_id
-    prompt "R2 Access Key ID"; read -r access_key
-    prompt "R2 Secret Access Key"; read -r secret_key
-    prompt "R2 Bucket name"; read -r bucket
 
     printf "\n"
-    step "  ⟳" "Testing R2 connection..."
-    local cloud_py
-    cloud_py=$(find_py "cloud.py")
-    local test_config
-    test_config=$(printf '{"account_id":"%s","access_key":"%s","secret_key":"%s","bucket":"%s"}' \
-        "$account_id" "$access_key" "$secret_key" "$bucket")
-    if python3 "$cloud_py" test "$test_config" >/dev/null 2>&1; then
-        ok "R2 connected"
+    prompt "GitHub org/owner for the data repo" "prdai-archive"; read -r owner
+    owner="${owner:-prdai-archive}"
+    prompt "Repo name" "zensync-data"; read -r repo
+    repo="${repo:-zensync-data}"
+
+    printf "\n"
+    if gh repo view "$owner/$repo" >/dev/null 2>&1; then
+        ok "Repo $owner/$repo already exists — will use it"
     else
-        die "could not connect to R2. Check your credentials and bucket name."
+        step "  ⟳" "Creating private repo $owner/$repo..."
+        gh repo create "$owner/$repo" --private \
+            --description "Private data store for zensync (Zen Browser sync) — cookies, logins, bookmarks, tabs. Not for browsing." \
+            >/dev/null || die "could not create $owner/$repo"
+        ok "Created $owner/$repo (private)"
+    fi
+
+    printf "\n"
+    step "  ⟳" "Setting up local clone..."
+    rm -rf "$DATA_DIR"
+    if git -c "http.https://github.com/.extraheader=AUTHORIZATION: bearer $(gh_token)" \
+        clone --quiet "https://github.com/$owner/$repo.git" "$DATA_DIR" 2>/dev/null; then
+        ok "Cloned existing data"
+    else
+        mkdir -p "$DATA_DIR"
+        git -C "$DATA_DIR" init --quiet -b main
+        git -C "$DATA_DIR" remote add origin "https://github.com/$owner/$repo.git"
+        ok "Initialized empty data repo (first sync will push)"
     fi
 
     cat > "$CONFIG_FILE" <<CONF
-R2_ACCOUNT_ID="$account_id"
-R2_ACCESS_KEY="$access_key"
-R2_SECRET_KEY="$secret_key"
-R2_BUCKET="$bucket"
+GH_OWNER="$owner"
+GH_REPO="$repo"
 LOCAL_PROFILE="$local_profile"
 CONF
     chmod 600 "$CONFIG_FILE"
 
     printf "\n"
     printf "  ${GREEN}${B}✓ Config saved${R}\n"
-    dim "  Run 'zensync init' on your other machine with the same bucket."
+    dim "  Run 'zensync init' on your other machine (same owner/repo, own gh auth)."
     dim "  Then just run 'zensync' on either machine whenever you switch."
     printf "\n"
 }
@@ -263,37 +305,30 @@ CONF
 # ─── Sync (the one command) ────────────────────────────────────────────
 cmd_sync() {
     load_config
+    require_gh
     header "sync"
 
     zen_close_local
 
-    local cloud_py merge_py
-    cloud_py=$(find_py "cloud.py")
-    merge_py=$(find_py "merge.py")
+    [[ -d "$DATA_DIR/.git" ]] || die "data repo missing at $DATA_DIR. Run 'zensync init'."
 
-    local tmp_dir
-    tmp_dir=$(mktemp -d)
+    step "  ↓" "Pulling latest from $GH_OWNER/$GH_REPO..."
+    git_data fetch --quiet origin main 2>/dev/null || true
+    local remote_exists
+    remote_exists=$(git_data rev-parse --verify origin/main 2>/dev/null || echo "")
+    if [[ -n "$remote_exists" ]]; then
+        git_data checkout --quiet -B main origin/main 2>/dev/null || \
+            git_data reset --quiet --hard origin/main
+        ok "Data repo up to date"
 
-    step "  ↓" "Pulling remote snapshot..."
-    local pull_config
-    pull_config=$(printf '{"account_id":"%s","access_key":"%s","secret_key":"%s","bucket":"%s","profile":"%s"}' \
-        "$R2_ACCOUNT_ID" "$R2_ACCESS_KEY" "$R2_SECRET_KEY" "$R2_BUCKET" "$tmp_dir")
-    local pull_result
-    pull_result=$(python3 "$cloud_py" pull "$pull_config" 2>/dev/null || echo '{"error":"pull failed"}')
-    local pull_error
-    pull_error=$(echo "$pull_result" | python3 -c "import sys,json; print(json.load(sys.stdin).get('error',''))" 2>/dev/null || echo "")
-
-    if [[ -n "$pull_error" ]]; then
-        dim "  No remote snapshot yet (first run) — will push local as-is."
-    else
-        ok "Remote snapshot downloaded"
-
-        if [[ -f "$tmp_dir/zen-sessions.jsonlz4" ]]; then
+        if [[ -f "$DATA_DIR/zen-sessions.jsonlz4" ]]; then
             step "  ⇄" "Merging tabs & workspaces..."
-            [[ -f "$tmp_dir/sessionstore-backups/recovery.jsonlz4" ]] && \
-                cp "$tmp_dir/sessionstore-backups/recovery.jsonlz4" "$tmp_dir/recovery.jsonlz4"
+            local merge_py
+            merge_py=$(find_py "merge.py")
+            [[ -f "$DATA_DIR/sessionstore-backups/recovery.jsonlz4" ]] && \
+                cp "$DATA_DIR/sessionstore-backups/recovery.jsonlz4" "$DATA_DIR/recovery.jsonlz4"
             local merge_result
-            merge_result=$(python3 "$merge_py" "$LOCAL_PROFILE" "$tmp_dir" 2>/dev/null || echo '{}')
+            merge_result=$(python3 "$merge_py" "$LOCAL_PROFILE" "$DATA_DIR" 2>/dev/null || echo '{}')
             local new_tabs new_spaces
             new_tabs=$(echo "$merge_result" | python3 -c "import sys,json; print(json.load(sys.stdin).get('new_tabs',0))" 2>/dev/null || echo 0)
             new_spaces=$(echo "$merge_result" | python3 -c "import sys,json; print(json.load(sys.stdin).get('new_spaces',0))" 2>/dev/null || echo 0)
@@ -302,40 +337,52 @@ cmd_sync() {
 
         step "  ⇄" "Syncing everything else (cookies, logins, bookmarks, prefs)..."
         for f in "${SYNC_FILES[@]}"; do
-            local is_merge_file=false
-            for mf in "${MERGE_FILES[@]}"; do
-                [[ "$f" == "$mf" ]] && is_merge_file=true && break
-            done
-            [[ "$is_merge_file" == "true" ]] && continue
-
-            local remote_f="$tmp_dir/$f"
+            is_merge_file "$f" && continue
+            local repo_f="$DATA_DIR/$f"
             local local_f="$LOCAL_PROFILE/$f"
-            [[ -f "$remote_f" ]] || continue
+            [[ -f "$repo_f" ]] || continue
 
-            local remote_mtime local_mtime
-            remote_mtime=$(mtime_of "$remote_f")
+            local repo_time local_mtime
+            repo_time=$(repo_commit_time_of "$f")
             local_mtime=$(mtime_of "$local_f")
 
-            if [[ "$remote_mtime" -gt "$local_mtime" ]]; then
+            if [[ "$repo_time" -gt "$local_mtime" ]]; then
                 mkdir -p "$(dirname "$local_f")"
-                cp -p "$remote_f" "$local_f"
+                cp -p "$repo_f" "$local_f"
                 ok "$f (took remote, newer)"
             fi
         done
+    else
+        dim "  No remote data yet (first run) — will push local as-is."
     fi
 
-    rm -rf "$tmp_dir"
-
     printf "\n"
-    step "  ↑" "Pushing merged snapshot to R2..."
-    local push_config
-    push_config=$(printf '{"account_id":"%s","access_key":"%s","secret_key":"%s","bucket":"%s","profile":"%s"}' \
-        "$R2_ACCOUNT_ID" "$R2_ACCESS_KEY" "$R2_SECRET_KEY" "$R2_BUCKET" "$LOCAL_PROFILE")
-    local push_result
-    push_result=$(python3 "$cloud_py" push "$push_config") || die "push failed"
-    local raw_size
-    raw_size=$(echo "$push_result" | python3 -c "import sys,json; print(json.load(sys.stdin)['raw_size'])")
-    ok "Uploaded $(human_size "$raw_size")"
+    step "  ↑" "Writing merged profile into data repo..."
+    copy_profile_into_repo
+    git_data add -A
+
+    if git_data diff --cached --quiet; then
+        dim "  Nothing changed"
+    else
+        git_data -c user.name="$GIT_COMMIT_NAME" -c user.email="$GIT_COMMIT_EMAIL" \
+            commit --quiet -m "sync from $(hostname) at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        ok "Committed"
+
+        step "  ↑" "Pushing..."
+        if ! git_data push --quiet -u origin main 2>/dev/null; then
+            dim "  Push rejected (other device pushed first) — retrying with fresh state..."
+            git_data fetch --quiet origin main
+            git_data reset --quiet --hard origin/main
+            copy_profile_into_repo
+            git_data add -A
+            if ! git_data diff --cached --quiet; then
+                git_data -c user.name="$GIT_COMMIT_NAME" -c user.email="$GIT_COMMIT_EMAIL" \
+                    commit --quiet -m "sync from $(hostname) at $(date -u +%Y-%m-%dT%H:%M:%SZ) [retry]"
+                git_data push --quiet -u origin main || die "push failed after retry — check network/gh auth"
+            fi
+        fi
+        ok "Pushed to $GH_OWNER/$GH_REPO"
+    fi
 
     printf "\n"
     zen_open_local
@@ -346,29 +393,25 @@ cmd_sync() {
 # ─── Status ───────────────────────────────────────────────────────────
 cmd_status() {
     load_config
+    require_gh
     header "status"
 
     printf "  ${PURPLE}${B}LOCAL${R} ${D}(%s)${R}\n" "$(hostname)"
-    printf "  ${D}%s${R}\n" "$LOCAL_PROFILE"
+    printf "  ${D}%s${R}\n\n" "$LOCAL_PROFILE"
 
-    local cloud_py
-    cloud_py=$(find_py "cloud.py")
-    local status_config
-    status_config=$(printf '{"account_id":"%s","access_key":"%s","secret_key":"%s","bucket":"%s"}' \
-        "$R2_ACCOUNT_ID" "$R2_ACCESS_KEY" "$R2_SECRET_KEY" "$R2_BUCKET")
-
-    printf "\n  ${PURPLE}${B}REMOTE${R} ${D}(R2 bucket: %s)${R}\n" "$R2_BUCKET"
-    local result
-    result=$(python3 "$cloud_py" status "$status_config" 2>/dev/null || echo '{"error":"could not reach R2"}')
-    local error
-    error=$(echo "$result" | python3 -c "import sys,json; print(json.load(sys.stdin).get('error',''))" 2>/dev/null)
-    if [[ -n "$error" ]]; then
-        fail "$error"
+    printf "  ${PURPLE}${B}DATA REPO${R} ${D}(%s/%s)${R}\n" "$GH_OWNER" "$GH_REPO"
+    if [[ ! -d "$DATA_DIR/.git" ]]; then
+        fail "not cloned locally — run 'zensync init'"
+        printf "\n"
+        return
+    fi
+    git_data fetch --quiet origin main 2>/dev/null || true
+    local last_commit
+    last_commit=$(git_data log origin/main -1 --format="%s (%cr)" 2>/dev/null || echo "")
+    if [[ -n "$last_commit" ]]; then
+        dim "  Last sync: $last_commit"
     else
-        local ts hostname_r
-        ts=$(echo "$result" | python3 -c "import sys,json; print(json.load(sys.stdin)['timestamp'])")
-        hostname_r=$(echo "$result" | python3 -c "import sys,json; print(json.load(sys.stdin)['hostname'])")
-        dim "  Last push: $ts from $hostname_r"
+        dim "  No syncs yet"
     fi
     printf "\n"
 }
