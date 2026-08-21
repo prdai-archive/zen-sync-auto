@@ -156,6 +156,7 @@ load_config() {
 
 require_gh() {
     command -v gh >/dev/null 2>&1 || die "gh (GitHub CLI) not found. Install it: brew install gh"
+    command -v rsync >/dev/null 2>&1 || die "rsync not found (needed to sync extensions/theme dirs). Install it."
     gh auth status >/dev/null 2>&1 || die "not logged in to gh. Run 'gh auth login' first."
 }
 
@@ -190,6 +191,36 @@ SYNC_FILES=(
     "cookies.sqlite"
     "logins.json"
     "key4.db"
+    "addonStartup.json.lz4"
+    "extensions.json"
+    "extension-preferences.json"
+    "extension-settings.json"
+    "search.json.mozlz4"
+    "handlers.json"
+    "autofill-profiles.json"
+    "zen-keyboard-shortcuts.json"
+    "zen-themes.json"
+    "zen-live-folders.jsonlz4"
+    "tabnotes.sqlite"
+    "content-prefs.sqlite"
+    "formhistory.sqlite"
+)
+
+# Whole directories, two-way merged with `rsync --update` (per-file: whichever
+# side has the newer mtime wins, nothing is deleted). Covers installed
+# extensions + their per-extension settings, and custom userChrome/userContent
+# CSS. Deliberately excludes `storage/` (per-site IndexedDB/localStorage —
+# often 500MB+ of web app cache, not a "setting") and Firefox-Sync-account
+# state (`weave/`, `signedInUser.json`, `storage-sync-v2.sqlite`,
+# `synced-tabs.db`) which would fight with this tool's own sync mechanism.
+SYNC_DIRS=(
+    "extensions"
+    "browser-extension-data"
+    "extension-store"
+    "extension-store-menus"
+    "extension-store-userscripts"
+    "chrome"
+    "settings"
 )
 
 MERGE_FILES=(
@@ -229,6 +260,21 @@ copy_profile_into_repo() {
         local dst="$DATA_DIR/$f"
         mkdir -p "$(dirname "$dst")"
         cp -p "$src" "$dst"
+    done
+    for d in "${SYNC_DIRS[@]}"; do
+        [[ -d "$LOCAL_PROFILE/$d" ]] || continue
+        mkdir -p "$DATA_DIR/$d"
+        rsync -a --update "$LOCAL_PROFILE/$d/" "$DATA_DIR/$d/"
+    done
+}
+
+# Two-way merge a synced dir: newer file (by mtime) wins on each side,
+# nothing is ever deleted by this.
+merge_dirs_from_repo() {
+    for d in "${SYNC_DIRS[@]}"; do
+        [[ -d "$DATA_DIR/$d" ]] || continue
+        mkdir -p "$LOCAL_PROFILE/$d"
+        rsync -a --update "$DATA_DIR/$d/" "$LOCAL_PROFILE/$d/"
     done
 }
 
@@ -333,6 +379,7 @@ cmd_sync() {
             new_tabs=$(echo "$merge_result" | python3 -c "import sys,json; print(json.load(sys.stdin).get('new_tabs',0))" 2>/dev/null || echo 0)
             new_spaces=$(echo "$merge_result" | python3 -c "import sys,json; print(json.load(sys.stdin).get('new_spaces',0))" 2>/dev/null || echo 0)
             [[ "$new_tabs" -gt 0 || "$new_spaces" -gt 0 ]] && ok "Merged $new_tabs new tabs, $new_spaces new spaces" || dim "  Nothing new to merge"
+            rm -f "$DATA_DIR/recovery.jsonlz4"
         fi
 
         step "  ⇄" "Syncing everything else (cookies, logins, bookmarks, prefs)..."
@@ -352,6 +399,10 @@ cmd_sync() {
                 ok "$f (took remote, newer)"
             fi
         done
+
+        step "  ⇄" "Syncing extensions, extension settings & theme CSS..."
+        merge_dirs_from_repo
+        ok "Directories merged"
     else
         dim "  No remote data yet (first run) — will push local as-is."
     fi

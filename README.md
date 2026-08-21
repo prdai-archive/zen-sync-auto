@@ -21,9 +21,26 @@ bookmarks, and tabs just show up.
   workspace), not overwritten
 - Bookmarks + history (`places.sqlite`), favicons
 - Cookies (`cookies.sqlite`) and saved logins (`logins.json` + `key4.db`)
-- Site permissions (`permissions.sqlite`)
+- Site permissions (`permissions.sqlite`), per-site zoom/prefs
+  (`content-prefs.sqlite`), form autofill (`formhistory.sqlite`)
 - Prefs, containers, and UI layout (`prefs.js`, `xulstore.json`) — sidebar
   placement, toolbar customizations, etc.
+- Installed extensions and their per-extension settings (`extensions/`,
+  `browser-extension-data/`, `extensions.json`, `extension-preferences.json`,
+  `extension-settings.json`, `addonStartup.json.lz4`)
+- Custom search engines (`search.json.mozlz4`), default app/protocol
+  handlers (`handlers.json`), address autofill (`autofill-profiles.json`)
+- Zen-specific settings: keyboard shortcuts, themes, live folders, tab notes,
+  and custom `userChrome`/`userContent` CSS (`chrome/`)
+
+Not synced, on purpose:
+- `storage/` — per-site IndexedDB/localStorage. Often 500MB+ of web app
+  cache, not a setting; would blow up the git repo.
+- Firefox-Sync-account state (`weave/`, `signedInUser.json`,
+  `storage-sync-v2.sqlite`, `synced-tabs.db`) — would fight with this tool's
+  own sync mechanism if you're also signed into Firefox/Mozilla Sync.
+- Cert store (`cert9.db`, `cert_override.txt`) — niche; open an issue if you
+  need this.
 
 Anything that isn't a session/tab file (i.e. can't be meaningfully merged)
 is copied from whichever side has the newer content, decided by comparing
