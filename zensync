@@ -5,7 +5,7 @@ set -euo pipefail
 # workspaces, tabs, prefs) between machines, backed by a private GitHub repo
 # instead of a cloud bucket. Uses your existing `gh auth login` session — no
 # separate credentials, no encryption layer. Commits are made under a fixed
-# bot identity, not your real git identity.
+# Claude identity, not your real git identity.
 
 # ─── Config ───────────────────────────────────────────────────────────
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/zensync"
@@ -13,8 +13,8 @@ CONFIG_FILE="$CONFIG_DIR/config"
 DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/zensync/repo"
 OS_NAME="$(uname -s)"
 
-GIT_COMMIT_NAME="zensync-bot"
-GIT_COMMIT_EMAIL="zensync-bot@users.noreply.github.com"
+GIT_COMMIT_NAME="Claude"
+GIT_COMMIT_EMAIL="noreply@anthropic.com"
 
 # ─── Colors & UI ─────────────────────────────────────────────────────
 R="\033[0m"

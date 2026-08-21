@@ -39,9 +39,10 @@ there and pushes. Auth is entirely `gh`'s: the script pulls a token via
 `gh auth token` and passes it as a transient header on each git operation —
 it's never written into `.git/config` or any file on disk.
 
-Commits are made under a fixed bot identity (`zensync-bot`, not your real
-git name/email), so the repo's commit log doesn't leak personal info even
-though it's already private.
+Commits into the data repo are made under a fixed `Claude
+<noreply@anthropic.com>` identity, not your real git name/email, so the
+repo's commit log doesn't leak personal info even though it's already
+private.
 
 ## ⚠️ No encryption, by design
 
