@@ -48,6 +48,7 @@ usage() {
     header "help"
     printf "${B}  Usage:${R}\n"
     printf "    ${WHITE}zensync${R}              ${D}Close Zen, pull+merge remote, push, reopen Zen${R}\n"
+    printf "    ${WHITE}zensync${R} ${YELLOW}push${R}         ${D}Publish this machine's Zen state${R}\n"
     printf "    ${WHITE}zensync${R} ${YELLOW}pull${R}         ${D}Pull remote onto this machine only, never pushes${R}\n"
     printf "    ${WHITE}zensync${R} ${YELLOW}status${R}       ${D}Show last sync info${R}\n"
     printf "    ${WHITE}zensync${R} ${YELLOW}init${R}         ${D}Setup wizard (uses your gh auth session)${R}\n"
@@ -513,6 +514,32 @@ cmd_sync() {
     printf "\n  ${GREEN}${B}✓ Sync complete${R}\n\n"
 }
 
+# ─── Push only (local -> remote) ─────────────────────────────────────
+cmd_push() {
+    load_config
+    require_gh
+    header "push"
+
+    zen_close_local
+    [[ -d "$DATA_DIR/.git" ]] || die "data repo missing at $DATA_DIR. Run 'zensync init'."
+
+    step "  ↑" "Writing local profile into data repo..."
+    copy_profile_into_repo
+    git_data add -A
+    if git_data diff --cached --quiet; then
+        dim "  Nothing changed"
+    else
+        git_data -c user.name="$GIT_COMMIT_NAME" -c user.email="$GIT_COMMIT_EMAIL" \
+            commit --quiet -m "push from $(hostname) at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        ok "Committed"
+    fi
+
+    step "  ↑" "Pushing to $GH_OWNER/$GH_REPO..."
+    git_data push --quiet -u origin main || die "push failed — remote has newer state; use 'zensync pull' first"
+    ok "Pushed"
+    zen_open_local
+}
+
 # ─── Status ───────────────────────────────────────────────────────────
 cmd_status() {
     load_config
@@ -542,6 +569,7 @@ cmd_status() {
 # ─── Main ─────────────────────────────────────────────────────────────
 case "${1:-sync}" in
     sync)   cmd_sync ;;
+    push)   cmd_push ;;
     pull)   cmd_pull ;;
     status) cmd_status ;;
     init)   cmd_init ;;
